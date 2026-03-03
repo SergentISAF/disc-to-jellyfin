@@ -124,12 +124,13 @@ def rip_disc(cfg: dict, disc_label: str) -> Path | None:
 
     cmd = [
         makemkv,
+        "--robot",
+        "--progress=-stdout",
         "mkv",
         "disc:0",
         "all",
         str(out_dir),
         "--minlength=%d" % min_secs,
-        "--progress=-stdout",
     ]
     log.info("Kommando: %s", " ".join(cmd))
 
