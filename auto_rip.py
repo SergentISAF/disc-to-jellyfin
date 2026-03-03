@@ -30,6 +30,11 @@ _encode_lock = threading.Lock()
 _active_procs: list = []
 # Pauser progress-output når main-tråden venter på bruger-input
 _suppress_progress = False
+# GUI callbacks — None = CLI-mode (konsol-output)
+_on_progress = None       # callback(stage: str, pct: float) — stage = "rip" | "encode"
+_on_status = None         # callback(status: str) — "Venter", "Ripper", etc.
+_on_title_resolved = None # callback(title: str) — viser filmtitel i GUI
+_on_title_input = None    # callback(disc_label, metadata) -> str — erstatter input()
 
 # Logging — fil + konsol
 logging.basicConfig(
@@ -69,6 +74,8 @@ def _iter_output(proc):
 
 def _set_title(text: str):
     """Opdatér konsol-vinduets titellinje."""
+    if _on_progress is not None:
+        return  # GUI styrer sin egen titel
     os.system(f"title {text}")
 
 
@@ -225,12 +232,15 @@ def _print_makemkv_progress(line: str, title: str):
             current = int(vals[0])
             maximum = int(vals[2])
             if maximum > 0:
-                pct = current * 100 // maximum
+                pct = current * 100 / maximum
+                if _on_progress:
+                    _on_progress("rip", pct)
+                    return
                 bar_width = 30
-                filled = bar_width * current // maximum
+                filled = int(bar_width * pct / 100)
                 bar = "█" * filled + "░" * (bar_width - filled)
-                print(f"\r  RIP  [{bar}] {pct}%", end="", flush=True)
-                _set_title(f"Auto-Rip: MakeMKV {pct}% — {title}")
+                print(f"\r  RIP  [{bar}] {int(pct)}%", end="", flush=True)
+                _set_title(f"Auto-Rip: MakeMKV {int(pct)}% — {title}")
     except (IndexError, ValueError):
         pass
 
@@ -292,6 +302,9 @@ def compress(cfg: dict, raw_dir: Path) -> list[Path]:
                     match = re.search(r"(\d+\.\d+)\s*%", line)
                     if match:
                         pct = float(match.group(1))
+                        if _on_progress:
+                            _on_progress("encode", pct)
+                            continue
                         bar_width = 30
                         filled = int(bar_width * pct / 100)
                         bar = "█" * filled + "░" * (bar_width - filled)
@@ -659,17 +672,20 @@ def lookup_tmdb(cfg: dict, disc_label: str, metadata_titles: list[str] | None = 
     push_notify(cfg, "Auto-Rip: Ukendt film",
                 f"Disc-label: {disc_label}\nMetadata: {meta_str}\nIndtast filmnavn ved PC'en")
 
-    _suppress_progress = True
-    print()
-    print("  ┌─────────────────────────────────────────┐")
-    print(f"  │  Disc-label: {disc_label:<27s} │")
-    if metadata_titles:
-        print(f"  │  Metadata: {meta_str:<29s} │")
-    print("  │  TMDb kunne ikke finde filmen.          │")
-    print("  └─────────────────────────────────────────┘")
-    print()
-    user_input = input("  Indtast filmnavn (eller Enter = brug disc-label): ").strip()
-    _suppress_progress = False
+    if _on_title_input:
+        user_input = _on_title_input(disc_label, metadata_titles)
+    else:
+        _suppress_progress = True
+        print()
+        print("  ┌─────────────────────────────────────────┐")
+        print(f"  │  Disc-label: {disc_label:<27s} │")
+        if metadata_titles:
+            print(f"  │  Metadata: {meta_str:<29s} │")
+        print("  │  TMDb kunne ikke finde filmen.          │")
+        print("  └─────────────────────────────────────────┘")
+        print()
+        user_input = input("  Indtast filmnavn (eller Enter = brug disc-label): ").strip()
+        _suppress_progress = False
 
     if user_input:
         result = _search_tmdb(api_key, user_input)
@@ -730,6 +746,8 @@ def run_pipeline(cfg: dict, disc_label: str):
     log.info("=" * 60)
 
     # 0. Hent metadata fra discen og slå op i TMDb
+    if _on_status:
+        _on_status("Søger titel...")
     metadata_titles = get_disc_metadata(cfg)
     tmdb_name = lookup_tmdb(cfg, disc_label, metadata_titles)
     if tmdb_name:
@@ -739,12 +757,18 @@ def run_pipeline(cfg: dict, disc_label: str):
         folder_name = sanitize_name(disc_label)
         display_name = disc_label
         log.info("Bruger disc-label som mappenavn: %s", folder_name)
+    if _on_title_resolved:
+        _on_title_resolved(display_name)
 
     # 1. Rip (bruger drevet — blokerer) — brug det korrekte mappenavn
+    if _on_status:
+        _on_status("Ripper...")
     raw_dir = rip_disc(cfg, folder_name)
     if raw_dir is None:
         notify("Auto-Rip Fejl", f"MakeMKV fejlede for {display_name}")
         push_notify(cfg, "Auto-Rip Fejl", f"MakeMKV fejlede for {display_name}")
+        if _on_status:
+            _on_status("Fejl — MakeMKV")
         return
 
     # 2. Eject med det samme — drevet er frit til næste disc
@@ -773,13 +797,19 @@ def _post_process(cfg: dict, raw_dir, folder_name: str, display_name: str):
         log.info("=== Post-processing starter: %s ===", display_name)
 
         # Compress
+        if _on_status:
+            _on_status("Komprimerer...")
         done_files = compress(cfg, raw_dir)
         if not done_files:
             notify("Auto-Rip Fejl", f"HandBrake fejlede for {display_name}")
             push_notify(cfg, "Auto-Rip Fejl", f"HandBrake fejlede for {display_name}")
+            if _on_status:
+                _on_status("Fejl — HandBrake")
             return
 
         # Transfer
+        if _on_status:
+            _on_status("Overfører...")
         transfer_ok = transfer(cfg, done_files, folder_name)
         if not transfer_ok:
             notify("Auto-Rip Advarsel", f"{display_name} overført med fejl — tjek loggen")
@@ -801,6 +831,10 @@ def _post_process(cfg: dict, raw_dir, folder_name: str, display_name: str):
         log.info("PIPELINE FÆRDIG: %s", msg)
         notify("Auto-Rip Færdig", msg)
         push_notify(cfg, "Auto-Rip Færdig", msg)
+        if _on_status:
+            _on_status("Færdig — venter på disc...")
+        if _on_progress:
+            _on_progress("encode", 0)
     finally:
         _encode_lock.release()
 
