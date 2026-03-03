@@ -1,0 +1,21 @@
+{
+    "drive_letter": "H",
+    "poll_interval_seconds": 10,
+    "makemkv_path": "C:\\Program Files (x86)\\MakeMKV\\makemkvcon64.exe",
+    "handbrake_path": "C:\\Users\\YourUser\\Desktop\\auto-rip\\HandBrakeCLI.exe",
+    "handbrake_quality": 18,
+    "audio_languages": "dan,eng",
+    "subtitle_languages": "dan,eng",
+    "min_title_seconds": 3600,
+    "raw_dir": "D:\\Rips\\raw",
+    "done_dir": "D:\\Rips\\done",
+    "jellyfin_host": "192.168.1.100",
+    "jellyfin_port": 8096,
+    "jellyfin_api_key": "",
+    "scp_user": "user",
+    "scp_host": "192.168.1.100",
+    "scp_dest": "/path/to/jellyfin/media/movies",
+    "delete_raw_after_compress": true,
+    "delete_done_after_transfer": false,
+    "tmdb_api_key": ""
+}

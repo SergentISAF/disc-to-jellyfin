@@ -1,0 +1,4 @@
+config.json
+*.log
+HandBrakeCLI*
+__pycache__/
