@@ -634,12 +634,15 @@ def lookup_tmdb(cfg: dict, disc_label: str, metadata_titles: list[str] | None = 
         if result:
             return result
 
-    # Alle automatiske forsøg fejlede — spørg brugeren
+    # Alle automatiske forsøg fejlede — push-notifikation + spørg brugeren
     log.warning("TMDb: Ingen automatiske match — spørger om manuel titel")
+    meta_str = ", ".join(metadata_titles) if metadata_titles else "ingen"
+    push_notify(cfg, "Auto-Rip: Ukendt film",
+                f"Disc-label: {disc_label}\nMetadata: {meta_str}\nIndtast filmnavn ved PC'en")
     print()
     print(f"  Disc-label: {disc_label}")
     if metadata_titles:
-        print(f"  Metadata-titler: {', '.join(metadata_titles)}")
+        print(f"  Metadata-titler: {meta_str}")
     print("  TMDb kunne ikke finde filmen automatisk.")
     print()
     user_input = input("  Indtast filmnavn (eller tryk Enter for at bruge disc-label): ").strip()
