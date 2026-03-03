@@ -26,6 +26,8 @@ LOG_PATH = SCRIPT_DIR / "auto_rip.log"
 
 # Kø-lock: kun én HandBrake/SCP-proces ad gangen
 _encode_lock = threading.Lock()
+# Aktive child-processer (til cleanup ved stop)
+_active_procs: list = []
 
 # Logging — fil + konsol
 logging.basicConfig(
@@ -140,6 +142,7 @@ def rip_disc(cfg: dict, disc_label: str) -> Path | None:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
         )
+        _active_procs.append(proc)
         for line in _iter_output(proc):
             if line.startswith("PRGV:"):
                 _print_makemkv_progress(line, disc_label)
@@ -152,6 +155,7 @@ def rip_disc(cfg: dict, disc_label: str) -> Path | None:
         print()
         _set_title("Auto-Rip DVD/Blu-ray")
         proc.wait()
+        _active_procs.remove(proc)
 
         if proc.returncode != 0:
             log.error("MakeMKV fejlede med kode %d", proc.returncode)
@@ -264,6 +268,7 @@ def compress(cfg: dict, raw_dir: Path) -> list[Path]:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
             )
+            _active_procs.append(proc)
             for line in _iter_output(proc):
                 if "Encoding:" in line and "%" in line:
                     match = re.search(r"(\d+\.\d+)\s*%", line)
@@ -281,6 +286,7 @@ def compress(cfg: dict, raw_dir: Path) -> list[Path]:
             print()
             _set_title("Auto-Rip DVD/Blu-ray")
             proc.wait()
+            _active_procs.remove(proc)
 
             if proc.returncode != 0:
                 log.error("HandBrake fejlede med kode %d for %s", proc.returncode, mkv.name)
@@ -721,6 +727,14 @@ def main():
 
     except KeyboardInterrupt:
         log.info("")
+        log.info("Auto-Rip stopper — afslutter aktive processer...")
+        for proc in _active_procs:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+                log.info("  Stoppet: PID %d", proc.pid)
+            except Exception:
+                proc.kill()
         log.info("Auto-Rip stoppet af bruger")
 
 
