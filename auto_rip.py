@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -22,6 +23,9 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent
 CONFIG_PATH = SCRIPT_DIR / "config.json"
 LOG_PATH = SCRIPT_DIR / "auto_rip.log"
+
+# Kø-lock: kun én HandBrake/SCP-proces ad gangen
+_encode_lock = threading.Lock()
 
 # Logging — fil + konsol
 logging.basicConfig(
@@ -434,6 +438,26 @@ def _escape_ps(s: str) -> str:
     return s.replace("'", "''")
 
 
+def push_notify(cfg: dict, title: str, msg: str):
+    """Send push-notifikation via Ntfy til mobil."""
+    topic = cfg.get("ntfy_topic", "")
+    if not topic:
+        return
+
+    base = cfg.get("ntfy_url", "https://ntfy.sh")
+    url = f"{base}/{topic}"
+    data = msg.encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Title", title)
+    req.add_header("Tags", "cd,movie_camera")
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            log.info("Ntfy push sendt (status %d)", resp.status)
+    except Exception as e:
+        log.warning("Ntfy push fejlede: %s", e)
+
+
 # ---------------------------------------------------------------------------
 # TMDb titel-opslag
 # ---------------------------------------------------------------------------
@@ -511,6 +535,29 @@ def lookup_tmdb(cfg: dict, disc_label: str) -> str | None:
 # Hjælpefunktioner
 # ---------------------------------------------------------------------------
 
+def _wait_for_handbrake():
+    """Vent på at en evt. eksisterende HandBrake-proces afslutter (fra tidligere kørsel)."""
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq HandBrakeCLI.exe", "/NH"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if "HandBrakeCLI.exe" in result.stdout:
+            log.info("HandBrake kører allerede (fra tidligere session) — venter...")
+            push_notify(load_config(), "Auto-Rip", "Venter på igangværende HandBrake encode")
+            while True:
+                time.sleep(30)
+                result = subprocess.run(
+                    ["tasklist", "/FI", "IMAGENAME eq HandBrakeCLI.exe", "/NH"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if "HandBrakeCLI.exe" not in result.stdout:
+                    log.info("Forrige HandBrake encode afsluttet")
+                    break
+    except Exception:
+        pass
+
+
 def sanitize_name(name: str) -> str:
     """Gør et disc-label til et sikkert mappenavn."""
     # Erstat ugyldige tegn
@@ -525,12 +572,11 @@ def sanitize_name(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 def run_pipeline(cfg: dict, disc_label: str):
-    """Kør hele rip → compress → transfer → refresh → eject pipelinen."""
+    """Rip disc → eject → start post-processing i baggrunden.
+    Returnerer hurtigt så hovedløkken kan polle for ny disc."""
     log.info("=" * 60)
     log.info("PIPELINE START: %s", disc_label)
     log.info("=" * 60)
-
-    start_time = time.time()
 
     # 0. TMDb opslag — find korrekt filmnavn
     tmdb_name = lookup_tmdb(cfg, disc_label)
@@ -542,41 +588,69 @@ def run_pipeline(cfg: dict, disc_label: str):
         display_name = disc_label
         log.info("Bruger disc-label som mappenavn: %s", folder_name)
 
-    # 1. Rip
+    # 1. Rip (bruger drevet — blokerer)
     raw_dir = rip_disc(cfg, disc_label)
     if raw_dir is None:
         notify("Auto-Rip Fejl", f"MakeMKV fejlede for {display_name}")
+        push_notify(cfg, "Auto-Rip Fejl", f"MakeMKV fejlede for {display_name}")
         return
 
-    # 2. Compress
-    done_files = compress(cfg, raw_dir)
-    if not done_files:
-        notify("Auto-Rip Fejl", f"HandBrake fejlede for {display_name}")
-        return
-
-    # 3. Transfer — brug TMDb-navn som mappenavn
-    transfer_ok = transfer(cfg, done_files, folder_name)
-    if not transfer_ok:
-        notify("Auto-Rip Advarsel", f"{display_name} overført med fejl — tjek loggen")
-
-    # 4. Jellyfin refresh
-    refresh_jellyfin(cfg)
-
-    # 5. Eject
+    # 2. Eject med det samme — drevet er frit til næste disc
     eject_disc()
+    push_notify(cfg, "Disc klar", f"{display_name} rippet — indsæt næste disc")
 
-    elapsed = time.time() - start_time
-    hours = int(elapsed // 3600)
-    minutes = int((elapsed % 3600) // 60)
+    # 3. Post-processing i baggrundstråd (HandBrake → SCP → Jellyfin)
+    thread = threading.Thread(
+        target=_post_process,
+        args=(cfg, raw_dir, folder_name, display_name),
+        daemon=True,
+    )
+    thread.start()
 
-    msg = f"{display_name} færdig på {hours}t {minutes}m"
-    if transfer_ok:
-        msg += " — overført til Jellyfin"
-    else:
-        msg += " — filer ligger lokalt (SCP fejl)"
 
-    log.info("PIPELINE FÆRDIG: %s", msg)
-    notify("Auto-Rip Færdig", msg)
+def _post_process(cfg: dict, raw_dir, folder_name: str, display_name: str):
+    """Compress → transfer → refresh. Kører i baggrundstråd med kø-lock."""
+    # Vent på at evt. forrige encode er færdig (kun én HandBrake ad gangen)
+    if _encode_lock.locked():
+        log.info("HandBrake kø: %s venter på forrige encode...", display_name)
+        push_notify(cfg, "Auto-Rip Kø", f"{display_name} venter på forrige encode")
+    _encode_lock.acquire()
+
+    try:
+        start_time = time.time()
+        log.info("=== Post-processing starter: %s ===", display_name)
+
+        # Compress
+        done_files = compress(cfg, raw_dir)
+        if not done_files:
+            notify("Auto-Rip Fejl", f"HandBrake fejlede for {display_name}")
+            push_notify(cfg, "Auto-Rip Fejl", f"HandBrake fejlede for {display_name}")
+            return
+
+        # Transfer
+        transfer_ok = transfer(cfg, done_files, folder_name)
+        if not transfer_ok:
+            notify("Auto-Rip Advarsel", f"{display_name} overført med fejl — tjek loggen")
+            push_notify(cfg, "Auto-Rip Advarsel", f"{display_name} overført med fejl")
+
+        # Jellyfin refresh
+        refresh_jellyfin(cfg)
+
+        elapsed = time.time() - start_time
+        hours = int(elapsed // 3600)
+        minutes = int((elapsed % 3600) // 60)
+
+        msg = f"{display_name} færdig på {hours}t {minutes}m"
+        if transfer_ok:
+            msg += " — overført til Jellyfin"
+        else:
+            msg += " — filer ligger lokalt (SCP fejl)"
+
+        log.info("PIPELINE FÆRDIG: %s", msg)
+        notify("Auto-Rip Færdig", msg)
+        push_notify(cfg, "Auto-Rip Færdig", msg)
+    finally:
+        _encode_lock.release()
 
 
 # ---------------------------------------------------------------------------
@@ -605,6 +679,9 @@ def main():
         log.warning("Download fra https://handbrake.fr/downloads2.php")
         log.warning("Scriptet fortsætter, men komprimering vil fejle")
 
+    # Tjek om HandBrake allerede kører (fra evt. tidligere kørsel)
+    _wait_for_handbrake()
+
     log.info("Drev: %s:", drive)
     log.info("MakeMKV: %s", cfg["makemkv_path"])
     log.info("HandBrake: %s", cfg["handbrake_path"])
@@ -630,11 +707,13 @@ def main():
 
                 run_pipeline(cfg, label)
 
+                # Disc blev ejected i run_pipeline — nulstil så næste disc detekteres
+                disc_was_present = False
                 log.info("")
                 log.info("Venter på ny disc i %s:...", drive)
 
             elif not label and disc_was_present:
-                # Disc fjernet
+                # Disc fjernet manuelt
                 disc_was_present = False
 
             time.sleep(interval)

@@ -17,5 +17,7 @@
     "scp_dest": "/path/to/jellyfin/media/movies",
     "delete_raw_after_compress": true,
     "delete_done_after_transfer": false,
-    "tmdb_api_key": ""
+    "tmdb_api_key": "",
+    "ntfy_url": "https://ntfy.sh",
+    "ntfy_topic": ""
 }
