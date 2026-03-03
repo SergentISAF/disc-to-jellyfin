@@ -130,7 +130,7 @@ def rip_disc(cfg: dict, folder_name: str) -> Path | None:
         "--progress=-stdout",
         "mkv",
         "disc:0",
-        "all",
+        "0",
         str(out_dir),
         "--minlength=%d" % min_secs,
     ]
