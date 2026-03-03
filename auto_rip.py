@@ -480,6 +480,9 @@ def _disc_label_to_query(label: str) -> str:
             break
     # Underscores og bindestreger til mellemrum
     query = query.replace("_", " ").replace("-", " ")
+    # Indsæt mellemrum mellem bogstaver og tal (TERMINATOR3 → TERMINATOR 3)
+    query = re.sub(r"([A-Za-z])(\d)", r"\1 \2", query)
+    query = re.sub(r"(\d)([A-Za-z])", r"\1 \2", query)
     # Fjern ekstra mellemrum og titlecase
     query = " ".join(query.split()).title()
     return query
