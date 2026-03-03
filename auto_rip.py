@@ -107,21 +107,19 @@ def detect_disc(drive_letter: str) -> str | None:
 # MakeMKV rip
 # ---------------------------------------------------------------------------
 
-def rip_disc(cfg: dict, disc_label: str) -> Path | None:
+def rip_disc(cfg: dict, folder_name: str) -> Path | None:
     """Rip alle titler > min_title_seconds fra disc:0. Returnerer output-mappen."""
     makemkv = cfg["makemkv_path"]
     if not Path(makemkv).exists():
         log.error("MakeMKV ikke fundet: %s", makemkv)
         return None
 
-    # Rens titlen til et mappenavn
-    safe_name = sanitize_name(disc_label)
-    out_dir = Path(cfg["raw_dir"]) / safe_name
+    out_dir = Path(cfg["raw_dir"]) / folder_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
     min_secs = cfg.get("min_title_seconds", 120)
 
-    log.info("=== MakeMKV rip starter: %s ===", disc_label)
+    log.info("=== MakeMKV rip starter: %s ===", folder_name)
     log.info("Output: %s", out_dir)
 
     cmd = [
@@ -145,7 +143,7 @@ def rip_disc(cfg: dict, disc_label: str) -> Path | None:
         _active_procs.append(proc)
         for line in _iter_output(proc):
             if line.startswith("PRGV:"):
-                _print_makemkv_progress(line, disc_label)
+                _print_makemkv_progress(line, folder_name)
             elif line.startswith("PRGT:"):
                 parts = line.split(",", 3)
                 if len(parts) >= 4:
@@ -203,7 +201,7 @@ def rip_disc(cfg: dict, disc_label: str) -> Path | None:
     return out_dir
 
 
-def _print_makemkv_progress(line: str, disc_label: str):
+def _print_makemkv_progress(line: str, title: str):
     """Parse MakeMKV PRGV-linje og vis progress-bar."""
     try:
         vals = line.split(":")[1].split(",")
@@ -216,7 +214,7 @@ def _print_makemkv_progress(line: str, disc_label: str):
                 filled = bar_width * current // maximum
                 bar = "█" * filled + "░" * (bar_width - filled)
                 print(f"\r  RIP  [{bar}] {pct}%", end="", flush=True)
-                _set_title(f"Auto-Rip: MakeMKV {pct}% — {disc_label}")
+                _set_title(f"Auto-Rip: MakeMKV {pct}% — {title}")
     except (IndexError, ValueError):
         pass
 
@@ -490,15 +488,9 @@ def _disc_label_to_query(label: str) -> str:
     return query
 
 
-def lookup_tmdb(cfg: dict, disc_label: str) -> str | None:
-    """Slå disc-label op i TMDb og returnér 'Titel (År)' eller None."""
-    api_key = cfg.get("tmdb_api_key", "")
-    if not api_key:
-        log.debug("TMDb API-nøgle ikke sat — springer opslag over")
-        return None
-
-    query = _disc_label_to_query(disc_label)
-    log.info("TMDb søgning: \"%s\" (fra disc-label: %s)", query, disc_label)
+def _search_tmdb(api_key: str, query: str) -> str | None:
+    """Søg TMDb for én query-streng. Returnér 'Titel (År)' eller None."""
+    log.info("TMDb søgning: \"%s\"", query)
 
     params = urllib.parse.urlencode({"api_key": api_key, "query": query, "language": "da-DK"})
     url = f"https://api.themoviedb.org/3/search/movie?{params}"
@@ -519,7 +511,7 @@ def lookup_tmdb(cfg: dict, disc_label: str) -> str | None:
             results = data.get("results", [])
 
         if not results:
-            log.warning("TMDb: Ingen resultater for \"%s\"", query)
+            log.info("TMDb: Ingen resultater for \"%s\"", query)
             return None
 
         # Brug første resultat (højest relevans)
@@ -539,8 +531,109 @@ def lookup_tmdb(cfg: dict, disc_label: str) -> str | None:
         return tmdb_name
 
     except Exception as e:
-        log.warning("TMDb opslag fejlede: %s", e)
+        log.warning("TMDb søgning fejlede for \"%s\": %s", query, e)
         return None
+
+
+def get_disc_metadata(cfg: dict) -> list[str]:
+    """Kør 'makemkvcon info disc:0' og returnér kandidat-titler fra metadata.
+    CINFO:2 = disc-navn, TINFO:x,2 = titel-navn for hvert spor."""
+    makemkv = cfg["makemkv_path"]
+    if not Path(makemkv).exists():
+        return []
+
+    log.info("Henter disc-metadata fra MakeMKV...")
+    cmd = [makemkv, "--robot", "info", "disc:0"]
+
+    candidates = []
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        for line in _iter_output(proc):
+            # CINFO:2,0,"The Real Movie Title"
+            if line.startswith("CINFO:2,"):
+                match = re.search(r'"([^"]+)"', line)
+                if match:
+                    candidates.append(match.group(1))
+            # TINFO:0,2,0,"The Real Movie Title"
+            elif re.match(r"TINFO:\d+,2,", line):
+                match = re.search(r'"([^"]+)"', line)
+                if match:
+                    val = match.group(1)
+                    if val not in candidates:
+                        candidates.append(val)
+        proc.wait()
+    except Exception as e:
+        log.warning("Disc-metadata fejl: %s", e)
+
+    # Filtrér ubrugelige entries (tomme, kun tal, filstier)
+    filtered = []
+    for c in candidates:
+        c = c.strip()
+        if not c:
+            continue
+        if re.match(r"^[\d_\-\.]+$", c):
+            continue
+        if "/" in c or "\\" in c:
+            continue
+        if len(c) < 2:
+            continue
+        filtered.append(c)
+
+    if filtered:
+        log.info("Disc-metadata titler: %s", filtered)
+    return filtered
+
+
+def lookup_tmdb(cfg: dict, disc_label: str, metadata_titles: list[str] | None = None) -> str | None:
+    """Slå filmnavn op i TMDb. Prøver i rækkefølge:
+    1. Metadata-titler fra MakeMKV (CINFO/TINFO)
+    2. Disc-label (volume label)
+    3. Bruger-input som fallback
+    """
+    api_key = cfg.get("tmdb_api_key", "")
+    if not api_key:
+        log.debug("TMDb API-nøgle ikke sat — springer opslag over")
+        return None
+
+    # Byg liste af søgestrenge at prøve (metadata først, derefter disc-label)
+    queries = []
+    if metadata_titles:
+        for title in metadata_titles:
+            q = _disc_label_to_query(title)
+            if q and q not in queries:
+                queries.append(q)
+
+    label_query = _disc_label_to_query(disc_label)
+    if label_query and label_query not in queries:
+        queries.append(label_query)
+
+    log.info("TMDb søger med %d kandidater (disc-label: %s)", len(queries), disc_label)
+
+    # Prøv hver query
+    for query in queries:
+        result = _search_tmdb(api_key, query)
+        if result:
+            return result
+
+    # Alle automatiske forsøg fejlede — spørg brugeren
+    log.warning("TMDb: Ingen automatiske match — spørger om manuel titel")
+    print()
+    print(f"  Disc-label: {disc_label}")
+    if metadata_titles:
+        print(f"  Metadata-titler: {', '.join(metadata_titles)}")
+    print("  TMDb kunne ikke finde filmen automatisk.")
+    print()
+    user_input = input("  Indtast filmnavn (eller tryk Enter for at bruge disc-label): ").strip()
+
+    if user_input:
+        result = _search_tmdb(api_key, user_input)
+        if result:
+            return result
+        # Brugeren skrev noget men TMDb fandt det stadig ikke — brug input direkte
+        log.info("TMDb fandt ikke \"%s\" — bruger det som filmnavn", user_input)
+        return user_input
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -590,8 +683,9 @@ def run_pipeline(cfg: dict, disc_label: str):
     log.info("PIPELINE START: %s", disc_label)
     log.info("=" * 60)
 
-    # 0. TMDb opslag — find korrekt filmnavn
-    tmdb_name = lookup_tmdb(cfg, disc_label)
+    # 0. Hent metadata fra discen og slå op i TMDb
+    metadata_titles = get_disc_metadata(cfg)
+    tmdb_name = lookup_tmdb(cfg, disc_label, metadata_titles)
     if tmdb_name:
         folder_name = sanitize_name(tmdb_name)
         display_name = tmdb_name
@@ -600,8 +694,8 @@ def run_pipeline(cfg: dict, disc_label: str):
         display_name = disc_label
         log.info("Bruger disc-label som mappenavn: %s", folder_name)
 
-    # 1. Rip (bruger drevet — blokerer)
-    raw_dir = rip_disc(cfg, disc_label)
+    # 1. Rip (bruger drevet — blokerer) — brug det korrekte mappenavn
+    raw_dir = rip_disc(cfg, folder_name)
     if raw_dir is None:
         notify("Auto-Rip Fejl", f"MakeMKV fejlede for {display_name}")
         push_notify(cfg, "Auto-Rip Fejl", f"MakeMKV fejlede for {display_name}")
