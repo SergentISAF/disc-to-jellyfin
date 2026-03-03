@@ -537,31 +537,50 @@ def _search_tmdb(api_key: str, query: str) -> str | None:
 
 def get_disc_metadata(cfg: dict) -> list[str]:
     """Kør 'makemkvcon info disc:0' og returnér kandidat-titler fra metadata.
-    CINFO:2 = disc-navn, TINFO:x,2 = titel-navn for hvert spor."""
+    CINFO:2 = disc-navn, TINFO:x,2 = titel-navn for hvert spor.
+    Timeout efter 90 sekunder hvis MakeMKV hænger."""
     makemkv = cfg["makemkv_path"]
     if not Path(makemkv).exists():
         return []
 
-    log.info("Henter disc-metadata fra MakeMKV...")
+    log.info("Henter disc-metadata fra MakeMKV (timeout 90s)...")
     cmd = [makemkv, "--robot", "info", "disc:0"]
 
     candidates = []
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        for line in _iter_output(proc):
-            # CINFO:2,0,"The Real Movie Title"
-            if line.startswith("CINFO:2,"):
-                match = re.search(r'"([^"]+)"', line)
-                if match:
-                    candidates.append(match.group(1))
-            # TINFO:0,2,0,"The Real Movie Title"
-            elif re.match(r"TINFO:\d+,2,", line):
-                match = re.search(r'"([^"]+)"', line)
-                if match:
-                    val = match.group(1)
-                    if val not in candidates:
-                        candidates.append(val)
-        proc.wait()
+        deadline = time.time() + 90
+
+        def _read_metadata():
+            for line in _iter_output(proc):
+                if time.time() > deadline:
+                    break
+                # CINFO:2,0,"The Real Movie Title"
+                if line.startswith("CINFO:2,"):
+                    match = re.search(r'"([^"]+)"', line)
+                    if match:
+                        candidates.append(match.group(1))
+                # TINFO:0,2,0,"The Real Movie Title"
+                elif re.match(r"TINFO:\d+,2,", line):
+                    match = re.search(r'"([^"]+)"', line)
+                    if match:
+                        val = match.group(1)
+                        if val not in candidates:
+                            candidates.append(val)
+
+        reader = threading.Thread(target=_read_metadata, daemon=True)
+        reader.start()
+        reader.join(timeout=90)
+
+        if reader.is_alive():
+            log.warning("Disc-metadata timeout (90s) — afbryder")
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+        else:
+            proc.wait()
     except Exception as e:
         log.warning("Disc-metadata fejl: %s", e)
 
