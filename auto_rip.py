@@ -253,6 +253,8 @@ def compress(cfg: dict, raw_dir: Path) -> list[Path]:
             "-e", "x265",
             "-q", str(quality),
             "-f", "av_mkv",
+            "--comb-detect",
+            "--decomb",
             "--audio-lang-list", audio_langs,
             "--all-audio",
             "--aencoder", "copy",
