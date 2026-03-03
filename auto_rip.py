@@ -28,6 +28,8 @@ LOG_PATH = SCRIPT_DIR / "auto_rip.log"
 _encode_lock = threading.Lock()
 # Aktive child-processer (til cleanup ved stop)
 _active_procs: list = []
+# Pauser progress-output når main-tråden venter på bruger-input
+_suppress_progress = False
 
 # Logging — fil + konsol
 logging.basicConfig(
@@ -141,6 +143,7 @@ def rip_disc(cfg: dict, folder_name: str) -> Path | None:
             stderr=subprocess.STDOUT,
         )
         _active_procs.append(proc)
+        skipped = 0
         for line in _iter_output(proc):
             if line.startswith("PRGV:"):
                 _print_makemkv_progress(line, folder_name)
@@ -149,7 +152,18 @@ def rip_disc(cfg: dict, folder_name: str) -> Path | None:
                 if len(parts) >= 4:
                     log.info("MakeMKV trin: %s", parts[3].strip('"'))
             elif line.startswith("MSG:"):
-                log.info("MakeMKV: %s", line)
+                # Skjul spam: "springes over" og "Kan ikke finde en celle"
+                if "MSG:3025," in line:
+                    skipped += 1
+                elif "MSG:3010," in line:
+                    pass  # VTS celle-advarsler — irrelevant
+                else:
+                    # Vigtige beskeder — vis dem på ny linje efter progress-bar
+                    print()
+                    log.info("MakeMKV: %s", line)
+        if skipped:
+            print()
+            log.info("MakeMKV: %d korte titler sprunget over (< %d sek)", skipped, cfg.get("min_title_seconds", 3600))
         print()
         _set_title("Auto-Rip DVD/Blu-ray")
         proc.wait()
@@ -203,6 +217,8 @@ def rip_disc(cfg: dict, folder_name: str) -> Path | None:
 
 def _print_makemkv_progress(line: str, title: str):
     """Parse MakeMKV PRGV-linje og vis progress-bar."""
+    if _suppress_progress:
+        return
     try:
         vals = line.split(":")[1].split(",")
         if len(vals) >= 3:
@@ -271,6 +287,8 @@ def compress(cfg: dict, raw_dir: Path) -> list[Path]:
             _active_procs.append(proc)
             for line in _iter_output(proc):
                 if "Encoding:" in line and "%" in line:
+                    if _suppress_progress:
+                        continue
                     match = re.search(r"(\d+\.\d+)\s*%", line)
                     if match:
                         pct = float(match.group(1))
@@ -635,17 +653,23 @@ def lookup_tmdb(cfg: dict, disc_label: str, metadata_titles: list[str] | None = 
             return result
 
     # Alle automatiske forsøg fejlede — push-notifikation + spørg brugeren
+    global _suppress_progress
     log.warning("TMDb: Ingen automatiske match — spørger om manuel titel")
     meta_str = ", ".join(metadata_titles) if metadata_titles else "ingen"
     push_notify(cfg, "Auto-Rip: Ukendt film",
                 f"Disc-label: {disc_label}\nMetadata: {meta_str}\nIndtast filmnavn ved PC'en")
+
+    _suppress_progress = True
     print()
-    print(f"  Disc-label: {disc_label}")
+    print("  ┌─────────────────────────────────────────┐")
+    print(f"  │  Disc-label: {disc_label:<27s} │")
     if metadata_titles:
-        print(f"  Metadata-titler: {meta_str}")
-    print("  TMDb kunne ikke finde filmen automatisk.")
+        print(f"  │  Metadata: {meta_str:<29s} │")
+    print("  │  TMDb kunne ikke finde filmen.          │")
+    print("  └─────────────────────────────────────────┘")
     print()
-    user_input = input("  Indtast filmnavn (eller tryk Enter for at bruge disc-label): ").strip()
+    user_input = input("  Indtast filmnavn (eller Enter = brug disc-label): ").strip()
+    _suppress_progress = False
 
     if user_input:
         result = _search_tmdb(api_key, user_input)
